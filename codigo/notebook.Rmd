@@ -1,0 +1,595 @@
+---
+title: "Modelo Hibrido de Localizacao de Instalacoes Logisticas: FACILITY LOCATION PROBLEM (FLP)"
+subtitle: "WU, S. W. A.; VALLIM FILHO, A. R. A. - 2024"
+output: html_notebook
+---
+
+```{r}
+rm(list = ls())
+set.seed(1234)
+library(kohonen)
+require(kohonen)
+library(RSNNS)
+
+somFunc <- kohonen::som
+
+df <- read.csv2("databases/csvUCHOA-1000.csv", header = TRUE, sep = ";")
+
+# ----- Data Frame (DF) sem a coluna de ID -----
+Data_Points <- df[2:4]
+str(Data_Points)
+```
+
+    MODELO SOM E ARQUITETURA
+    PREPARACAO: NORMALIZACAO dos DADOS
+Atribuicao de Rotulos as Colunas da Matriz Normalizada
+
+```{r}
+data_train_matrix <- as.matrix(normalizeData(Data_Points, type = "norm")) 
+colnames(data_train_matrix) <- c("X", "Y", "Demanda")
+Dim_X <- 23
+Dim_Y <- 22
+som_grid <- somgrid(xdim = Dim_X, ydim = Dim_Y, topo="rectangular") 
+
+som_model <- somFunc(data_train_matrix, 
+                 grid=som_grid,  
+                 rlen=500, 
+                 alpha=c(0.05,0.01), 
+                 keep.data = TRUE,
+                 radius = 5)
+```
+
+    NORMALIZACAO dos Prototypes / DESNORMALIZACAO dos Prototypes
+Prototypes ==>> Posicao dos Neuronios (Dim_X x Dim_Y neuronios)
+```{r}
+Prototypes_Norm <- as.data.frame(som_model$codes)
+
+Prototypes_DeNorm <- as.data.frame(denormalizeData(Prototypes_Norm, getNormParameters(data_train_matrix)))
+colnames(Prototypes_DeNorm) <- c("X", "Y", "Demanda")
+```
+
+
+    PLOTS of SOM Model
+```{r}
+plot(som_model, type="changes")
+
+#quantidade de amostras mapeadas em cada node (centroide)
+plot(som_model, type="count", main = "node counts")
+
+plot(som_model, type="dist.neighbours", main = "SOM neighbour distances") 
+
+plot(som_model, type="codes", main = "codes") 
+
+# Mostra a Alocacao de Pontos aos Neuronios
+som_model$unit.classif 
+```
+
+    INICIALIZACAO
+    INICIALIZACAO de VETORES
+- PointsDistanceVector = Vetor com Distâncias entre os Pontos de Demanda e os Prototipos e Prototypes (CANDIDATES)) para sua Media 
+- PrototypeDistanceVector, PrototypeDistanceVector_DeNormr = Vetor com Distâncias entre Prototypes posic a Media dos Prototypes
+- Prototype_costPerSquareMeter = Vector with Costs based in Distance
+
+```{r}
+neuromNumber <- Dim_X * Dim_Y # No de Neuronios - usado em Prototype locations 
+pointsNumber <- dim(Data_Points)[1] # No de Pontos
+D <- 0
+PointsDistanceVector <- c()
+PrototypeDistanceVector <- c() 
+
+PrototypeDistanceVector_DeNorm <- c()
+Prototype_costPerSquareMeter <- c()
+distanc <- function(Xc, Yc, Xw, Yw){
+  distance <- sqrt((Xw-Xc)**2+(Yw-Yc)**2)
+  return(distance)
+}
+```
+
+    USADO NO DATAFRAME DOS PROTOTYPES
+    DISTANCIA DES_NORMALIZADAS para MEDIA - com Coords Euclidianas
+    MEDIAS DES_NORMALIZADAS
+```{r}
+x_mean_Desnorm <- mean(Prototypes_DeNorm[,1]) # media x dos Prototypes  
+y_mean_Desnorm <- mean(Prototypes_DeNorm[,2]) # media y dos Prototypes
+
+for(val in 1:neuromNumber){
+  D_DeNorm <- distanc(Prototypes_DeNorm$X[[val]], Prototypes_DeNorm$Y[[val]], 
+               x_mean_Desnorm, y_mean_Desnorm)
+  PrototypeDistanceVector_DeNorm[val] <- D_DeNorm 
+}
+```
+
+DEFINICAO DO DATAFRAME DE PONTOS DE DEMANDA
+# >>>>> "PONTOS de DEMANDA" - Atributos: X, Y, Neuronio de Alocacao e Demanda
+```{r}
+Points_Locations <- data.frame(
+  id = 1:pointsNumber,
+  x = Data_Points[,1],
+  y = Data_Points[,2],
+  localiz = as.matrix(som_model$unit.classif), # Ptos vs Neuronios
+  Demand = Data_Points[,3]
+)
+# View(Points_Locations) # X, Y, Neuronio, Demanda
+Average_Demand <- sum(Data_Points[,3])/neuromNumber
+Average_Demand
+#sum(Data_Points[,3])
+```
+
+#  ----- Comparacao de Metadados -----
+# str(Data_Points)
+# str(Points_Locations) # X, Y, Neuronio, Demanda
+
+    Soma DEMANDA (DESNORMALIZADA) de cada PROTOTIPO
+```{r}
+Protot_Demand <- vector(length = neuromNumber)
+for(i in 1:neuromNumber){
+  for(j in 1:pointsNumber){
+    if(Points_Locations$localiz[j] == i){
+      Protot_Demand[i] <- Protot_Demand[i] + Points_Locations$Demand[j]
+    }
+  }
+}
+```
+
+# ===>>> Se Demanda = 0 ==>> Demanda = Infinito!!
+# for(i in 1:neuromNumber){
+#   if(Protot_Demand[i] == 0){
+#     Protot_Demand[i] <- 999999999}
+#}
+# Protot_Demand
+length(Protot_Demand)
+
+    Calculo de SIZE e COST por PROTOTIPO (CANDIDATE
+# --- Inicializa Vetores ---
+```{r}
+Prototype_costs <- vector(length = neuromNumber)
+Prototype_size  <- vector(length = neuromNumber)
+```
+
+    PARAMETROS DE CUSTO: Define Densidade de UNIDADES/m2 ==>> UNIDADE = ton, m3, etc.
+    Calculo de CUSTO FIXO por Prototipo (CANDIDATO)
+# ........... Revisado com parametros definidos em 01/03
+```{r}
+sq_meter_per_Unit <- 5.6    # Vide Planilha de Densidades ==>> 8,3m2/ton
+Cost_per_sq_meter <- 27  # Vide Planilha de Densidades
+Cost_per_Unit <- 31.83    # Vide Planilha de Densidades ==>> 42,50/ton
+
+for(i in 1:neuromNumber){
+  Prototype_size[i] <- (Protot_Demand[i] * sq_meter_per_Unit)
+  Prototype_costs[i] <- (Protot_Demand[i] * Cost_per_Unit
+                      + Prototype_size[i]* Cost_per_sq_meter)
+}
+```
+
+# Dados de Prototypes (com "dist_to_mean" DES_NORMALIZADA)
+
+# >>>>> "PROTOTIPOS" <<<<<
+#        Atributos: X, Y, Dist p Media, $/m2, Demanda, Area e Custo
+```{r}
+Prototype_id <- neuromNumber # No Total de Neuronios
+
+Prototype_locations <- data.frame(
+  id = 1:Prototype_id,
+  x = Prototypes_DeNorm$X,
+  y = Prototypes_DeNorm$Y,
+  dist_to_mean = PrototypeDistanceVector_DeNorm, #dist of each Prototype to all Prototypes mean
+  # cost_per_square_meter = Prototype_costPerSquareMeter, #cost based on dist_to_mean quartiles (line 162)
+  total_Demand = Protot_Demand,
+  Prototype_size = Prototype_size, #size based on Demand 
+  Prototype_costs = Prototype_costs #cost based on Prototype_size and cost_per_square_meter
+)
+
+Tot_Demand <- sum(Protot_Demand)
+Tot_Demand
+Tot_Facilities_size <- Tot_Demand * sq_meter_per_Unit
+Tot_Facilities_size
+p_max <- 0.2*pointsNumber
+Fixed_Facility_Dem_Cost <- Tot_Demand/(p_max)*Cost_per_Unit
+Fixed_Facility_Size_Cost <- Tot_Facilities_size/(p_max) * Cost_per_sq_meter
+Fixed_Facility_Cost <- Fixed_Facility_Dem_Cost + Fixed_Facility_Size_Cost
+Fixed_Facility_Dem_Cost
+Fixed_Facility_Size_Cost
+Fixed_Facility_Cost
+```
+
+--------------------------------------------------------------------------------
+    CALCULOS DE CUSTO INICIANDO
+--------------------------------------------------------------------------------
+
+    MATRIZ de CUSTOS de TRANSPORTE: PONTOS-CANDIDATOS
+
+    FUNCAO para CALCULAR OS CUSTOS de TRANSPORTE
+              Com DISTANCIAS EUCLIDIANAS
+    DIST ENTRE PONTO i E PROT j
+```{r}
+Custo_Unitario_de_Transporte <- 0.36225  # <<<=== [ $/ton.km ]
+# fonte: ANTT 2024 - Carga Geral(item 5) - Lotação de Alto Desempenho - 2 eixos
+# R$/km = 2,898... Capac = 8t ==>>> $/t.km - 2,898/8 = 0,3625
+transportcost_func <- function(i, j) {
+  Point <-  Points_Locations[i, ]
+  Prototype <- Prototype_locations[j, ]
+  # calcula o custo de transporte com Dist. Euclidiana
+  # return(sqrt((Point$x-Prototype$x)**2+(Point$y-Prototype$y)**2) 
+  #        * (2.5/25) * (Prototype$Prototype_size * 12/0.3))
+  return(sqrt((Point$x-Prototype$x)**2+(Point$y-Prototype$y)**2) 
+         * (Custo_Unitario_de_Transporte) * (Point$Demand))
+}
+```
+
+
+    CRIA MATRIZ COM CUSTOS TOTAIS de TRANSPORTE: PONTOS-CANDIDATOS
+# Calcula Custo de Transporte de cada Ponto a todos os Candidatos
+# Usa Funcao "transport_cost_func" para esse Calculo
+# E gera a Matriz de Custos chamada de "transport_cost"
+#   ----- Com DISTANCIAS EUCLIDIANAS - DESNORMALIZADAS -----
+```{r}
+transportCostMatrixFact <- function(){
+  transport_cost <- matrix(nrow = pointsNumber, ncol = neuromNumber)
+  for(row in 1:pointsNumber){
+    for(col in 1:neuromNumber){
+      transport_cost[row, col] <- transportcost_func(row, col)
+    }
+  }
+  return(transport_cost)
+}
+```
+
+
+    CUSTO de TRANSPORTE USADO no MODELO MILP
+# --- Transformacao de Matriz de Custos em DF ---
+```{r}
+transport_cost <- as.data.frame(transportCostMatrixFact())
+```
+
+
+    MONTAGEM DO MODELO MILP
+j ==>> prototipo especifico
+i ==>> ponto de demanda especifico
+# masked functions: and, mod, or
+```{r}
+library(ompr)
+library(magrittr)
+
+model_MIP <- MIPModel() %>%
+  
+  # ===>>> VARIABLES DEFINITION: x[i,j]={0,1} and y[j]={0,1} ----------
+  
+  # x[i,j] = 1, iff Demand Point i gets assigned to Prototype j
+  add_variable(x[i, j], i = 1:pointsNumber, j = 1:neuromNumber, type = "binary") %>%
+  
+  # y[j] = 1, iff Prototype j is built (active)
+  add_variable(y[j], j = 1:neuromNumber, type = "binary") %>%
+  
+  # set_objective(sum_expr(transportcost_func(i, j) * x[i, j], i = 1:pointsNumber, j = 1:neuromNumber) +  #trocar por transport_cost[i,j]
+  #                 sum_expr(Prototype_costs[j] * y[j], j = 1:neuromNumber), "min") %>%        #trocar por Prototype_costs[j]
+
+  # ===>>> OBJECTIVE FUNCTION -------------
+    # set_objective(sum_expr(transport_cost[i, j] * x[i, j], i = 1:pointsNumber, j = 1:neuromNumber) +    #trocar por transport_cost[i,j]
+    #               sum_expr(Prototype_costs[j] * y[j], j = 1:neuromNumber), "min") %>%      #trocar por Prototype_costs[j]
+
+    # set_objective(sum_expr(transport_cost[i, j] * x[i, j], i = 1:pointsNumber, j = 1:neuromNumber) +
+    #                 sum_expr(Average_Protot_Cost * y[j], j = 1:neuromNumber), "min") %>%
+
+   # set_objective(sum_expr(transport_cost[i, j] * x[i, j], i = 1:pointsNumber, j = 1:neuromNumber) +
+   #                sum_expr(Fixed_Protot_Cost * y[j], j = 1:neuromNumber), "min") %>%
+  
+  set_objective(sum_expr(transport_cost[i, j] * x[i, j], i = 1:pointsNumber, j = 1:neuromNumber) +
+                  sum_expr(Fixed_Facility_Cost * y[j], j = 1:neuromNumber), "min") %>%
+  
+  # ===>>> CONSTRAINTS -------------
+# Every Demand Point needs to be assigned to a Prototype
+  add_constraint(sum_expr(x[i, j], j = 1:neuromNumber) == 1, i = 1:pointsNumber) %>% 
+  
+# If a Demand Point is assigned to a Prototype, the Prototype must be Active
+  add_constraint(x[i,j] <= y[j], i = 1:pointsNumber, j = 1:neuromNumber)
+
+model_MIP
+```
+    
+
+
+    RODAR O MODELO MILP - SOLUCAO OTIMA - RESULTADOS
+# OBS: A variavel Y define os Candidatos escolhidos para Facilities
+```{r}
+library(ompr.roi)
+library(ROI.plugin.glpk)
+
+result <- solve_model(model_MIP, with_ROI(solver = "glpk", verbose = TRUE))
+
+result$objective_value # Valor da Funcao Objetivo
+result$solution        # Valor das Variaveis Binarias: x e Y
+result$status          # Atingiu Solucao Otima (S/pointsNumber).. Sucesso
+result$model           # Caracterisiticas do MOdelo : MILP Model
+```
+
+--------------------------------------------------------------------------------
+-------------------------REVISAR PARA QUE ESCOLHA MAIS DE-----------------------
+--------------------------------------------------------------------------------
+
+    SOLUCAO OTIMA: Facilities, Alocacao e Custos
+    
+Yj ==>> Candidates_Selection = List of Selected Candidates
+```{r}
+Y_j <- vector(length = neuromNumber)
+for(i in 1:neuromNumber){
+  Y_selected <- result$solution[neuromNumber*pointsNumber + i]
+  Y_j[i] <- Y_selected
+}
+Y_j # Yj
+
+Y_j_DF <- as.data.frame(Y_j)
+
+# ===>>> p = # of Active Candidates 
+active_facilities=0
+for (i in 1:neuromNumber) {
+  active_facilities <- active_facilities + Y_j[i]
+}
+active_facilities
+```
+
+
+# ===>>> CUSTO TOTAL de Implantacao das FACILITIES
+```{r}
+Facilities_Opt_Cost=0
+for (i in 1:neuromNumber) {
+  Facilities_Opt_Cost <- Facilities_Opt_Cost + Fixed_Facility_Cost * Y_j[i] # Candidates_Selection[i]
+  
+  # Facilities_Opt_Cost <- Facilities_Opt_Cost + Prototype_locations$Prototype_costs[i] * Candidates_Selection_DF$Candidates_Selection[i]
+}
+Facilities_Opt_Cost 
+
+# ===>>> X_ij = Matriz de Alocacao "Pontos-Facilities"
+X_ij <- matrix(result$solution, ncol = neuromNumber, nrow=pointsNumber, byrow=T)
+dim(X_ij)
+dim(transport_cost)
+
+# ===>>> CUSTO TOTAL de TRANSPORTE: "Pontos-Facilities" 
+Transp_Opt_Cost=0
+for (i in 1:pointsNumber) {
+  for (j in 1:neuromNumber){
+    Transp_Opt_Cost <- Transp_Opt_Cost + transport_cost[i, j] * X_ij[i, j]
+  } 
+}
+Transp_Opt_Cost
+```
+
+
+# ===>>> CUSTO TOTAL da OPERACAO = Custo de TRANSPORTE + Custo de FACILITIES
+```{r}
+Total_Opt_Cost <- Transp_Opt_Cost + Facilities_Opt_Cost
+Total_Opt_Cost
+```
+
+# ===>> *** CHECAGEM ***: CUSTO TOTAL da OPERACAO via MODELO
+```{r}
+Total_Opt_Cost_Model <- result$objective_value
+Total_Opt_Cost_Model
+```
+
+# ===>>> PESOS % dos CUSTOS
+```{r}
+Weight_Facilities_Opt_Cost <- Facilities_Opt_Cost/Total_Opt_Cost*100
+Weight_Facilities_Opt_Cost
+
+Weight_Transp_Opt_Cost <- Transp_Opt_Cost/Total_Opt_Cost*100
+Weight_Transp_Opt_Cost
+```
+
+
+    GERAR MATRIZ COMPLETA DE SOLUCOES; Xij + Yj
+
+# ===>>> X_ij = Matriz de Alocacao "Pontos-Facilities"
+# ===>>> Y_j = Vetor de Candidatos Selecionados
+
+    Unir X_ij e Y_j
+    Criar Matriz Xij_Yj
+```{r}
+Xij_Yj <- X_ij
+dim(Xij_Yj)
+Xij_Yj =  rbind(Xij_Yj, Y_j)
+dim(Xij_Yj)
+
+# Teste
+Xij_Yj[110,]
+
+# Append de uma Linha a mais na Matriz com o Valor da F. Objetivo
+# O valor fica repetido em todas as posições da Linha
+K_N = 0
+c<- c()
+for(Col in 1:neuromNumber){
+  K_N <- K_N + 1
+  c <- append(c, result$objective_value, after = K_N)
+  }
+c
+
+Xij_Yj_FObj <- Xij_Yj
+dim(Xij_Yj_FObj)
+F_Obj <- c
+Xij_Yj_FObj =  rbind(Xij_Yj_FObj, F_Obj)
+dim(Xij_Yj_FObj)
+
+write.csv(Xij_Yj_FObj, "Solution_Test_Xij_Yj_FObj.csv")
+Data_SolutionXij_Yj_FObj<- read.csv("Solution_Test_Xij_Yj_FObj.csv", sep = ",", header = T)
+str(Data_SolutionXij_Yj_FObj)
+```
+
+
+
+              OUTRA ALTERNATIVA
+    NAO E NECESSARIO RODAR ESTA ALTERNATIVA
+              VETOR de SOLUCOES
+                  Xij + Yj
+          Total de Posicoes = pointsNumber*neuromNumber = neuromNumber
+```{r}
+Candidates_Solution <- c()
+K_N <- 0
+Lsup <- pointsNumber*neuromNumber + neuromNumber
+for (i in 1:Lsup) {
+  if (i==1)  {K_N <- K_N + i }
+  else       {K_N <- K_N + i + 1}
+  Candidates_Solution<- append(Candidates_Solution, result$solution[i], after = K_N)
+}
+
+# Teste... Print de Yj ultimas posicoes do vetor
+length(Candidates_Solution)
+Candidates_Solution[1309:1320]
+
+write.csv(Candidates_Solution, "Solution_Test113.csv")
+Data_Solution1<- read.csv("Solution_Test113.csv", sep = ",", header = T)
+str(Data_Solution1)
+```
+
+
+    GERACAO de MATRIZ de SOLUCOES
+```{r}
+Solution_Matrix <- matrix(nrow = pointsNumber+1, ncol = neuromNumber)
+dim(Solution_Matrix)
+  
+# N_Variables <- pointsNumber*neuromNumber + neuromNumber
+N_Variable <- 0
+N_Row <- pointsNumber + 1
+N_Col <- neuromNumber
+for(Row in 1:N_Row){
+  for(Col in 1:N_Col){
+  N_Variable <- N_Variable + 1
+  Solution_Matrix[Row, Col] <- result$solution[N_Variable]}}
+  
+# Append de uma Linha a mais na Matriz com o Valor da F. Objetivo
+# O valor fica repetido em todas as posições da Linha
+K_N = 0
+c<- c()
+for(Col in 1:N_Col){
+  K_N <- K_N + 1
+  c <- append(c, result$objective_value, after = K_N)}
+c
+
+F_Obj <- c
+Solution_Matrix =  rbind(Solution_Matrix, F_Obj)
+dim(Solution_Matrix)
+
+# Teste
+Solution_Matrix[N_Row+1,]
+Solution_Matrix[111,]
+
+write.csv(Solution_Matrix, "Solution_Matrix10011.csv")
+Matrix_Solution10011<- read.csv("Solution_Matrix10011.csv", sep = ",", header = T)
+str(Matrix_Solution10011)
+```
+
+
+
+            PLOTS
+      PRECISA AJUSTAR PARA USAR O MÉTODO NOVO ACIMA TAMBEM
+
+```{r}
+
+library(ggplot2)
+require(ggplot2)
+
+x11()
+
+grid_size <- 0
+#principal PLOT
+p <- ggplot(Points_Locations, aes(x, y)) +
+  geom_point() +
+  geom_point(data = Prototype_locations, color = "red", alpha = 0.5, shape = 17) +
+  scale_x_continuous(limits = c(0, 1000)) +
+  scale_y_continuous(limits = c(0, 1000)) +
+  theme(axis.title = element_blank(),
+        axis.ticks = element_blank(),
+        axis.text = element_blank(), panel.grid = element_blank())
+p + ggtitle("Prototype Location Problem",
+            "Black dots are customers. Light red triangles show potential Prototypes locations.")
+```
+
+        SEGUNDO PLOTS NAO FUNCIONANDO
+```{r}
+suppressPackageStartupMessages(library(dplyr))
+matching <- result %>% 
+  get_solution(x[i,j]) %>%
+  filter(value > .9) %>%  
+  select(i, j)
+
+x11()
+
+#add the assignments to the previous plot
+plot_assignment <- matching %>% 
+  inner_join(Points_Locations, by = c("i" = "id")) %>% 
+  inner_join(Prototype_locations, by = c("j" = "id"))
+customer_count <- matching %>% group_by(j) %>% summarise(pointsNumber = n()) %>% rename(id = j)
+
+###### problema com fixed cost (o custo fixo deste código varia)
+#armazéns escolhidos
+plot_Prototypes <- Prototype_locations %>%
+  mutate(costs = Prototype_costs) %>%
+  inner_join(customer_count, by = "id") %>%
+  filter(id %in% unique(matching$j))
+
+p <- p + 
+  geom_segment(data = plot_assignment, aes(x = x.y, y = y.y, xend = x.x, yend = y.x)) + 
+  geom_point(data  = plot_Prototypes, color = "red", size = 3, shape = 17) +
+  ggrepel::geom_label_repel(data  = plot_Prototypes, 
+                            aes(label = paste0("fixed costs:", costs, "; customers: ", pointsNumber )), 
+                            size = 3, nudge_y = 20) + 
+  ggtitle(paste0("Cost optimal Prototype Locations and customer assignment"),
+          "Big red triangles show Prototypes that will be built, light red are unused Prototype 
+          locations. Dots represent customers served by the respective Prototypes.")
+
+#fixed costs for setting up the 4 Prototypes:
+sum(Prototype_costs[unique(matching$j)])
+```
+
+Pegar resultados
+```{r}
+setwd("C:/Users/samue/Documents/Mestrado/defesa/codigo/resultados/plots-ret")
+plotfilename <- paste0(as.character(pointsNumber), "-" ,as.character(Dim_X), "x",as.character(Dim_Y), ".png")
+ggsave(
+  filename = plotfilename,
+  plot = p,
+  width = 14,       # em polegadas
+  height = 10,
+  dpi = 300         # alta qualidade (ideal para impressão)
+)
+
+model_MIP
+Facilities_Opt_Cost
+Transp_Opt_Cost
+active_facilities
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#fases
+FASE 1: >>>>> GERACAO DE PROTOTIPOS (CANDIDATOS) <<<<<
+ O modelo gera Prototipos por meio de uma rede SOM,
+   ===>>> PROTOTIPOS = NEURONIOS do SOM
+ Os Prototipos serao Locais CANDIDATOS a Instalacoes Logisticas
+   ===>>> PROTOTIPOS = NEURONIOS do SOM = CANDIDATOS
+
+FASE 2: >>>>> RESOLUCAO do FLP <<<<<
+Os Prototipos serao Dados de Entrada de um Modelo MILP
+O modelo MILP vai encontrar uma Solucao Otima para o FLP
+Na Solucao Otima os melhores Locais Candidatos sao selecionados
+Solucao Otima contem:
+ ==>> Candidatos Descartados e Ativados
+ ==>> Alocacao dos Pontos de Demanda a cada Candidato Ativo
+ ==>> Valor da Funcao Objetivo
